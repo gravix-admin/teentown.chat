@@ -1,5 +1,6 @@
 .env
 node_modules/
+.npm-cache/
 uploads/*
 npm-debug.log*
 .DS_Store
