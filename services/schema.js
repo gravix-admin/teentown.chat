@@ -135,6 +135,7 @@ async function initSchema() {
       about_me TEXT NULL,
       mood VARCHAR(80) DEFAULT '',
       theme VARCHAR(32) DEFAULT 'dark',
+      chat_background VARCHAR(40) DEFAULT 'moonlake',
       bubble_style VARCHAR(32) DEFAULT 'default',
       username_color VARCHAR(24) DEFAULT '',
       text_color VARCHAR(24) DEFAULT '',
@@ -418,6 +419,45 @@ async function initSchema() {
     )
   `);
 
+  await query(`
+    CREATE TABLE IF NOT EXISTS intruder_settings (
+      id TINYINT PRIMARY KEY DEFAULT 1,
+      enabled TINYINT DEFAULT 0,
+      interval_minutes INT DEFAULT 5,
+      bot_user_id INT NULL,
+      bot_name VARCHAR(80) DEFAULT 'Intruder',
+      bot_avatar_url MEDIUMTEXT NULL,
+      next_spawn_at DATETIME NULL,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+    )
+  `);
+
+  await query(`
+    CREATE TABLE IF NOT EXISTS intruder_rounds (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      room_id INT NOT NULL,
+      points INT NOT NULL,
+      status VARCHAR(20) DEFAULT 'active',
+      shooter_id INT NULL,
+      message_id INT NULL,
+      spawned_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      ends_at DATETIME NOT NULL,
+      resolved_at DATETIME NULL,
+      KEY intruder_status (status),
+      KEY intruder_room_status (room_id, status),
+      KEY intruder_ends_at (ends_at)
+    )
+  `);
+
+  await query(`
+    CREATE TABLE IF NOT EXISTS intruder_scores (
+      user_id INT PRIMARY KEY,
+      points INT DEFAULT 0,
+      shots INT DEFAULT 0,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+    )
+  `);
+
   await migrateExistingTables();
   await ensureUserIdentitiesAreUnique();
 
@@ -447,6 +487,7 @@ async function migrateExistingTables() {
       about_me: "TEXT NULL",
       mood: "VARCHAR(80) DEFAULT ''",
       theme: "VARCHAR(32) DEFAULT 'dark'",
+      chat_background: "VARCHAR(40) DEFAULT 'moonlake'",
       bubble_style: "VARCHAR(32) DEFAULT 'default'",
       username_color: "VARCHAR(24) DEFAULT ''",
       text_color: "VARCHAR(24) DEFAULT ''",
@@ -637,6 +678,7 @@ async function migrateExistingTables() {
       await ensureColumn(table, column, definition);
     }
   }
+  await query("ALTER TABLE users MODIFY COLUMN chat_background VARCHAR(40) DEFAULT 'moonlake'");
 
   const mediumTextColumns = {
     users: ["avatar_url", "banner_url", "animated_banner_url"],
@@ -727,6 +769,8 @@ async function migrateLegacyUserData() {
 }
 
 async function seedDefaults() {
+  await pool.query("UPDATE users SET chat_background = 'moonlake' WHERE chat_background IS NULL OR chat_background = ''");
+
   const [rooms] = await pool.query("SELECT COUNT(*) AS count FROM rooms");
   if (!rooms[0].count) {
     await pool.query(
@@ -801,6 +845,34 @@ async function seedDefaults() {
       ["admin", email, hash, "2007-07-08", 19, "other", "developer", "Developer account.", "Master account for Teens Town Chat.", 5000, 99999, 9999, "local", "Auto detected", "developer", "premium"]
     );
   }
+
+  const [botRows] = await pool.query("SELECT id FROM users WHERE LOWER(username) = 'intruder' LIMIT 1");
+  let intruderBotId = botRows[0]?.id;
+  if (!intruderBotId) {
+    const hash = await bcrypt.hash(`intruder-${Date.now()}`, 10);
+    const email = await unusedAdminEmail("intruder@teens-town.local");
+    const [result] = await pool.query(
+      `INSERT INTO users
+       (username, email, password_hash, dob, age, gender, rank_name, display_name, avatar_url, bio, about_me, xp, gold, diamonds, ip_address, country, frame, theme, chat_background)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ["Intruder", email, hash, "2007-01-01", 19, "other", "user", "Intruder", "/assets/intruder-bot.png", "Intruder game bot.", "Drops surprise point hunts in chat rooms.", 0, 0, 0, "system", "Teen Chat Town", "clean", "dark", "moonlake"]
+    );
+    intruderBotId = result.insertId;
+  } else {
+    await pool.query(
+      "UPDATE users SET display_name = 'Intruder', avatar_url = '/assets/intruder-bot.png', bio = 'Intruder game bot.' WHERE id = ?",
+      [intruderBotId]
+    );
+  }
+
+  await pool.query(
+    "INSERT IGNORE INTO intruder_settings (id, enabled, interval_minutes, bot_user_id, bot_name, bot_avatar_url) VALUES (1, 0, 5, ?, 'Intruder', '/assets/intruder-bot.png')",
+    [intruderBotId]
+  );
+  await pool.query(
+    "UPDATE intruder_settings SET bot_user_id = ?, bot_name = 'Intruder', bot_avatar_url = '/assets/intruder-bot.png' WHERE id = 1",
+    [intruderBotId]
+  );
 
   const achievements = [
     ["first_message", "First Message", "Sent your first message.", "#22d3ee"],
