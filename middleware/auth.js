@@ -16,13 +16,19 @@ async function attachUser(req, _res, next) {
     const payload = jwt.verify(token, process.env.JWT_SECRET);
     const [rows] = await pool.query("SELECT * FROM users WHERE id = ?", [payload.id]);
     req.user = rows[0] || null;
-  } catch (_error) {
+  } catch (error) {
+    if (pool.isTransientDatabaseError?.(error)) {
+      req.authDatabaseError = error;
+      console.error("Auth database lookup failed:", error.message);
+      return next();
+    }
     req.user = null;
   }
   next();
 }
 
 function requireAuth(req, res, next) {
+  if (req.authDatabaseError) return res.status(503).json({ error: "Database is reconnecting. Please try again in a moment." });
   if (!req.user) return res.status(401).json({ error: "Login required." });
   if (req.user.banned_until && new Date(req.user.banned_until) > new Date()) {
     return res.status(403).json({ error: "This account is banned." });
