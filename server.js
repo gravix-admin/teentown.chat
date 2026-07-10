@@ -5,7 +5,6 @@ const http = require("http");
 const express = require("express");
 const cors = require("cors");
 const jwt = require("jsonwebtoken");
-const { Server } = require("socket.io");
 const { initSchema } = require("./services/schema");
 const database = require("./database");
 const { attachUser } = require("./middleware/auth");
@@ -21,16 +20,25 @@ const app = express();
 const server = http.createServer(app);
 const port = Number(process.env.PORT || 3000);
 const isProduction = process.env.NODE_ENV === "production";
-const io = new Server(server, {
-  cors: { origin: true, credentials: true },
-  transports: ["websocket"],
-  allowUpgrades: false,
-  pingInterval: 25000,
-  pingTimeout: 20000,
-  maxHttpBufferSize: 1e6,
-});
+let SocketServer = null;
+try {
+  ({ Server: SocketServer } = require("socket.io"));
+} catch (error) {
+  console.warn("socket.io package is not installed; realtime will use the event-stream fallback.");
+}
 
-setSocketServer(io);
+const io = SocketServer
+  ? new SocketServer(server, {
+      cors: { origin: true, credentials: true },
+      transports: ["websocket"],
+      allowUpgrades: false,
+      pingInterval: 25000,
+      pingTimeout: 20000,
+      maxHttpBufferSize: 1e6,
+    })
+  : null;
+
+if (io) setSocketServer(io);
 
 let compression = null;
 try {
@@ -70,6 +78,12 @@ app.use("/api/auth", authRoutes);
 app.use("/api/chat", chatRoutes);
 app.use("/api/social", socialRoutes);
 app.use("/api/admin", adminRoutes);
+
+if (!io) {
+  app.get("/socket.io/socket.io.js", (_req, res) => {
+    res.type("application/javascript").send("");
+  });
+}
 
 app.get("/api/health", (_req, res) => {
   res.json({ ok: true, name: "Teens Town Chat" });
@@ -114,38 +128,40 @@ process.on("uncaughtException", (error) => {
   console.error("Uncaught error:", error);
 });
 
-io.use(async (socket, next) => {
-  try {
-    const token = socket.handshake.auth?.token || socket.handshake.query?.token;
-    if (!token) return next(new Error("Login required."));
-    const payload = jwt.verify(String(token), process.env.JWT_SECRET);
-    const [rows] = await database.query("SELECT * FROM users WHERE id = ?", [payload.id]);
-    const user = rows[0];
-    if (!user) return next(new Error("Login required."));
-    if (user.banned_until && new Date(user.banned_until) > new Date()) return next(new Error("This account is banned."));
-    if (user.kicked_until && new Date(user.kicked_until) > new Date()) return next(new Error("You were temporarily kicked. Please try again later."));
-    socket.user = user;
-    next();
-  } catch (error) {
-    console.error("Socket auth failed:", error.message);
-    next(new Error(database.isTransientDatabaseError?.(error) ? "Database is reconnecting." : "Login required."));
-  }
-});
-
-io.on("connection", async (socket) => {
-  socket.join(`user:${socket.user.id}`);
-  socket.emit("ready", true);
-  await database.query("UPDATE users SET last_seen = NOW() WHERE id = ?", [socket.user.id]).catch((error) => {
-    console.error("Could not update last_seen for socket connect:", error.message);
+if (io) {
+  io.use(async (socket, next) => {
+    try {
+      const token = socket.handshake.auth?.token || socket.handshake.query?.token;
+      if (!token) return next(new Error("Login required."));
+      const payload = jwt.verify(String(token), process.env.JWT_SECRET);
+      const [rows] = await database.query("SELECT * FROM users WHERE id = ?", [payload.id]);
+      const user = rows[0];
+      if (!user) return next(new Error("Login required."));
+      if (user.banned_until && new Date(user.banned_until) > new Date()) return next(new Error("This account is banned."));
+      if (user.kicked_until && new Date(user.kicked_until) > new Date()) return next(new Error("You were temporarily kicked. Please try again later."));
+      socket.user = user;
+      next();
+    } catch (error) {
+      console.error("Socket auth failed:", error.message);
+      next(new Error(database.isTransientDatabaseError?.(error) ? "Database is reconnecting." : "Login required."));
+    }
   });
-  broadcast("users-changed", { userId: socket.user.id });
-  socket.on("disconnect", async () => {
+
+  io.on("connection", async (socket) => {
+    socket.join(`user:${socket.user.id}`);
+    socket.emit("ready", true);
     await database.query("UPDATE users SET last_seen = NOW() WHERE id = ?", [socket.user.id]).catch((error) => {
-      console.error("Could not update last_seen for socket disconnect:", error.message);
+      console.error("Could not update last_seen for socket connect:", error.message);
     });
     broadcast("users-changed", { userId: socket.user.id });
+    socket.on("disconnect", async () => {
+      await database.query("UPDATE users SET last_seen = NOW() WHERE id = ?", [socket.user.id]).catch((error) => {
+        console.error("Could not update last_seen for socket disconnect:", error.message);
+      });
+      broadcast("users-changed", { userId: socket.user.id });
+    });
   });
-});
+}
 
 server.listen(port, () => {
   console.log(`Teens Town Chat running on http://127.0.0.1:${port}`);
