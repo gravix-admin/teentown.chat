@@ -27,9 +27,8 @@ function imageUpload(folder) {
 
 function fileToDataUrl(file) {
   if (!file) return null;
-  const data = fs.readFileSync(file.path).toString("base64");
-  fs.unlink(file.path, () => {});
-  return `data:${file.mimetype};base64,${data}`;
+  const folder = path.basename(path.dirname(file.path));
+  return `/uploads/${encodeURIComponent(folder)}/${encodeURIComponent(file.filename)}`;
 }
 
 module.exports = { imageUpload, fileToDataUrl };
