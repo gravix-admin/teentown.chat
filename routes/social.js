@@ -7,6 +7,7 @@ const { imageUpload, fileToDataUrl } = require("../services/upload");
 
 const router = express.Router();
 const galleryUpload = imageUpload("gallery");
+const newsUpload = imageUpload("news");
 const giftCatalog = {
   rose: { title: "Rose", costGold: 50 },
   star: { title: "Star", costGold: 100 },
@@ -27,6 +28,12 @@ async function notification(userId, type, title, body = "") {
     [userId, type, title, body]
   );
   notifyUser(userId, "notification", { id: result.insertId, type, title, body });
+}
+
+async function permission(user, tool) {
+  if (user.rank_name === "developer") return true;
+  const [[row]] = await pool.query("SELECT allowed FROM role_permissions WHERE rank_name = ? AND tool = ?", [user.rank_name, tool]);
+  return Boolean(row?.allowed);
 }
 
 router.get("/friends", requireAuth, async (req, res) => {
@@ -59,6 +66,7 @@ router.post("/friend-requests", requireAuth, async (req, res) => {
     [req.user.id, toUserId]
   );
   await notification(toUserId, "friend-request", "New friend request", `${req.user.username} sent you a friend request.`);
+  notifyUser(toUserId, "friend-request-updated", { fromUserId: req.user.id });
   res.status(201).json({ ok: true });
 });
 
@@ -68,11 +76,15 @@ router.post("/friend-requests/:id/accept", requireAuth, async (req, res) => {
   await pool.query("UPDATE friend_requests SET status = 'accepted', updated_at = NOW() WHERE id = ?", [request.id]);
   await pool.query("INSERT IGNORE INTO friends (user_id, friend_id) VALUES (?, ?), (?, ?)", [request.from_user_id, request.to_user_id, request.to_user_id, request.from_user_id]);
   await notification(request.from_user_id, "friend-accepted", "Friend request accepted", `${req.user.username} accepted your friend request.`);
+  notifyUser(request.from_user_id, "friend-request-updated", { userId: req.user.id });
+  notifyUser(request.to_user_id, "friend-request-updated", { userId: request.from_user_id });
   res.json({ ok: true });
 });
 
 router.post("/friend-requests/:id/decline", requireAuth, async (req, res) => {
+  const [[request]] = await pool.query("SELECT * FROM friend_requests WHERE id = ? AND to_user_id = ?", [req.params.id, req.user.id]);
   await pool.query("UPDATE friend_requests SET status = 'declined', updated_at = NOW() WHERE id = ? AND to_user_id = ?", [req.params.id, req.user.id]);
+  if (request) notifyUser(request.from_user_id, "friend-request-updated", { userId: req.user.id });
   res.json({ ok: true });
 });
 
@@ -329,6 +341,20 @@ router.get("/news", requireAuth, async (_req, res) => {
   res.json(rows.map((row) => ({ ...row, comments: comments.filter((comment) => Number(comment.news_id) === Number(row.id)) })));
 });
 
+router.post("/news", requireAuth, newsUpload.single("image"), async (req, res) => {
+  if (!(await permission(req.user, "postNews"))) return res.status(403).json({ error: "Your rank cannot post news." });
+  const title = String(req.body.title || "").trim().slice(0, 120);
+  const body = String(req.body.body || "").trim().slice(0, 2000);
+  const imageUrl = req.file ? fileToDataUrl(req.file) : null;
+  if (!title || !body) return res.status(400).json({ error: "News title and body are required." });
+  const [result] = await pool.query(
+    "INSERT INTO news_posts (author_id, title, body, image_url) VALUES (?, ?, ?, ?)",
+    [req.user.id, title, body, imageUrl]
+  );
+  broadcast("news-posted", { id: result.insertId, title });
+  res.status(201).json({ id: result.insertId });
+});
+
 router.post("/news/:id/comments", requireAuth, async (req, res) => {
   const body = String(req.body.body || "").trim().slice(0, 500);
   if (!body) return res.status(400).json({ error: "Comment cannot be empty." });
@@ -351,7 +377,16 @@ router.get("/leaderboards", requireAuth, async (_req, res) => {
   const [xp] = await pool.query(`SELECT ${project} FROM users ORDER BY xp DESC, username ASC LIMIT 20`);
   const [gold] = await pool.query(`SELECT ${project} FROM users ORDER BY gold DESC, username ASC LIMIT 20`);
   const [diamonds] = await pool.query(`SELECT ${project} FROM users ORDER BY diamonds DESC, username ASC LIMIT 20`);
-  res.json({ xp, gold, diamonds });
+  const [shooters] = await pool.query(
+    `SELECT u.id, u.username, u.display_name, u.avatar_url, u.rank_name, u.profile_title,
+            u.xp, u.gold, u.diamonds, u.message_count,
+            s.points AS intruder_points, s.shots AS intruder_shots
+     FROM intruder_scores s
+     JOIN users u ON u.id = s.user_id
+     ORDER BY s.points DESC, s.shots DESC, u.username ASC
+     LIMIT 20`
+  );
+  res.json({ xp, gold, diamonds, shooters });
 });
 
 router.post("/memberships/svip", requireAuth, async (req, res) => {
@@ -389,7 +424,7 @@ router.post("/memberships/svip", requireAuth, async (req, res) => {
 });
 
 router.get("/notifications", requireAuth, async (req, res) => {
-  const [rows] = await pool.query("SELECT * FROM notifications WHERE user_id = ? ORDER BY created_at DESC LIMIT 50", [req.user.id]);
+  const [rows] = await pool.query("SELECT * FROM notifications WHERE user_id = ? ORDER BY created_at DESC LIMIT 12", [req.user.id]);
   res.json(rows);
 });
 
