@@ -23,6 +23,10 @@ const state = {
   leaderboardTab: "xp",
   compactLayout: null,
   pmExpanded: false,
+  permissions: {},
+  usersRefreshTimer: null,
+  socket: null,
+  eventSource: null,
 };
 
 const $ = (selector, root = document) => root.querySelector(selector);
@@ -45,13 +49,15 @@ const giftCatalog = [
   ["diamond", "Diamond", 500],
 ];
 const emojiChoices = ["😀", "😂", "😊", "😍", "🥰", "😎", "😭", "😡", "👍", "👎", "👏", "🙏", "💀", "🔥", "✨", "❤️", "💙", "💎", "👑", "🎉", "🌙", "⭐", "😴", "🤝"];
-const themeChoices = [
-  ["dark", "Dark", "#0b1020"],
-  ["light", "Light", "#f8fafc"],
-  ["blue", "Blue", "#0f3a5d"],
-  ["neon", "Neon", "#111827"],
-  ["glass", "Glass", "#223044"],
+const defaultRoomBackground = "moonlake";
+const roomBackgroundChoices = [
+  ["moonlake", "Moon Lake", "/assets/room-bg-moonlake.webp"],
+  ["autumn", "Autumn Trail", "/assets/room-bg-autumn.webp"],
+  ["neon-city", "Neon Rain", "/assets/room-bg-neon-city.webp"],
+  ["sunrise", "Sunrise Valley", "/assets/room-bg-sunrise.webp"],
 ];
+const roomBackgroundUrls = Object.fromEntries(roomBackgroundChoices.map(([id, _label, url]) => [id, url]));
+const intruderPrefix = "::intruder:";
 
 function roomLocked(room) {
   return Boolean(room?.locked || room?.password_hash);
@@ -73,6 +79,8 @@ function html(value) {
 }
 
 function toast(message) {
+  const text = String(message || "").replace(/\s+/g, " ").trim().slice(0, 180);
+  if (!text) return;
   let area = $("#toastArea");
   if (!area) {
     area = document.createElement("div");
@@ -80,9 +88,14 @@ function toast(message) {
     area.className = "toast-area";
     document.body.append(area);
   }
+  const now = Date.now();
+  if (area.dataset.lastMessage === text && now - Number(area.dataset.lastAt || 0) < 2500) return;
+  area.dataset.lastMessage = text;
+  area.dataset.lastAt = String(now);
+  while (area.children.length >= 2) area.firstElementChild.remove();
   const item = document.createElement("div");
   item.className = "toast";
-  item.textContent = message;
+  item.textContent = text;
   area.append(item);
   setTimeout(() => item.remove(), 3600);
 }
@@ -238,6 +251,62 @@ function applyTheme(theme = "dark") {
   localStorage.setItem("tct_theme", theme);
 }
 
+function cssUrl(value) {
+  return `url(${JSON.stringify(value)})`;
+}
+
+function assetUrl(value) {
+  if (!value || /^(data:|blob:|https?:\/\/|\/)/i.test(value)) return value;
+  return `/${value.replace(/^\.?\//, "")}`;
+}
+
+function currentRoomImage() {
+  const room = state.rooms.find((item) => Number(item.id) === Number(state.currentRoomId));
+  return room?.image_url || room?.imageUrl || "/assets/room-main.svg";
+}
+
+function normalizeRoomBackground(value) {
+  return roomBackgroundUrls[value] ? value : defaultRoomBackground;
+}
+
+function applyRoomBackground(value = state.me?.chatBackground) {
+  const backgroundId = normalizeRoomBackground(value);
+  const selected = assetUrl(roomBackgroundUrls[backgroundId] || roomBackgroundUrls[defaultRoomBackground] || currentRoomImage());
+  const image = cssUrl(selected);
+  document.documentElement.style.setProperty("--room-image", image);
+  document.body.style.setProperty("--room-image", image);
+  const messages = $("#messages");
+  if (messages) {
+    messages.dataset.roomBackground = backgroundId;
+    messages.style.setProperty("--room-image", image);
+    messages.style.backgroundColor = "#07111f";
+    messages.style.backgroundImage = `linear-gradient(180deg, rgba(6, 10, 18, .38), rgba(6, 10, 18, .56)), ${image}`;
+    messages.style.backgroundPosition = "center center, center center";
+    messages.style.backgroundRepeat = "no-repeat, no-repeat";
+    messages.style.backgroundSize = "cover, cover";
+  }
+}
+
+function hasTool(tool) {
+  return state.me?.rank === "developer" || Boolean(state.permissions?.[tool]);
+}
+
+function canPostNews() {
+  return hasTool("postNews");
+}
+
+function syncNewsComposerAccess() {
+  const allowed = canPostNews();
+  $("#newsComposeButton")?.classList.toggle("hidden", !allowed);
+  if (!allowed) {
+    const composer = $("#newsComposerArea");
+    if (composer) {
+      composer.classList.add("hidden");
+      composer.innerHTML = "";
+    }
+  }
+}
+
 function setTypingIdle() {
   const typing = $("#typingText");
   if (typing) typing.textContent = "No one is typing";
@@ -286,11 +355,13 @@ function openEmojiPicker(inputSelector, anchor) {
 async function bootstrap() {
   const data = await api("/api/auth/me");
   state.me = data.me;
+  if (state.me) state.me.chatBackground = normalizeRoomBackground(state.me.chatBackground);
   state.rooms = data.rooms;
   state.users = data.users;
   state.notifications = data.notifications || [];
   state.friendRequests = data.friendRequests || [];
   state.rankBadges = data.rankBadges || {};
+  state.permissions = data.permissions || {};
   state.unreadPm = Number(data.unreadPm || 0);
   state.currentRoomId = state.currentRoomId || state.rooms[0]?.id;
   $("#authScreen").classList.add("hidden");
@@ -300,6 +371,7 @@ async function bootstrap() {
   $("#topAvatar").src = avatar(state.me);
   $("#reportFlagIcon").classList.toggle("hidden", !staffRanks.has(state.me.rank));
   setBadges();
+  syncNewsComposerAccess();
   refreshReportBadge().catch(() => {});
   renderRooms();
   renderUsers();
@@ -316,7 +388,7 @@ function renderRooms() {
   if (room) {
     $("#roomTitle").textContent = room.name;
     $("#roomDescription").textContent = room.description;
-    document.body.style.setProperty("--room-image", `url('${room.image_url || "/assets/room-main.svg"}')`);
+    applyRoomBackground();
   }
   renderRoomGrid();
 }
@@ -394,7 +466,7 @@ function openRoomPasswordModal(room) {
 async function loadMessages() {
   if (!state.currentRoomId) return;
   try {
-    state.messages = await api(`/api/chat/rooms/${state.currentRoomId}/messages`);
+    state.messages = await api(`/api/chat/rooms/${state.currentRoomId}/messages?limit=50`);
     setTypingIdle();
     renderMessages();
   } catch (error) {
@@ -434,7 +506,7 @@ function renderMessages() {
     return `
       <article class="message ${isOwn ? "own" : ""}${bubbleClass}" data-message-id="${message.id}">
         <button class="message-avatar-button" data-message-profile="${message.user_id}" type="button" title="View profile">
-          <img class="avatar" src="${html(avatar(user))}" alt="" />
+          <img class="avatar" src="${html(avatar(user))}" alt="" loading="lazy" decoding="async" />
         </button>
         <div class="message-card" style="--message-color:${html(user.textColor || "#fbf7ff")}">
           <div class="message-topline">
@@ -449,8 +521,8 @@ function renderMessages() {
             </div>
           </div>
           ${reply ? `<div class="reply-preview"><strong>@${html(reply.username)}</strong><span>${html(String(reply.body || "").slice(0, 90))}</span></div>` : ""}
-          <p>${renderMessageBody(message.body || "")}</p>
-          ${message.attachment_url ? `<img class="attachment" src="${html(message.attachment_url)}" alt="attachment" />` : ""}
+          <div class="message-body">${renderMessageBody(message.body || "", user)}</div>
+          ${message.attachment_url ? `<img class="attachment" src="${html(message.attachment_url)}" alt="attachment" loading="lazy" decoding="async" />` : ""}
           <div class="badge-grid">${reactions.map((reaction) => `<span class="rank-pill">${html(reaction.emoji)} ${reaction.count}</span>`).join("")}</div>
         </div>
       </article>
@@ -460,7 +532,43 @@ function renderMessages() {
   $("#messages").scrollTop = $("#messages").scrollHeight;
 }
 
-function renderMessageBody(body) {
+function renderIntruderMessage(payload) {
+  const type = String(payload?.type || "");
+  if (type === "alert") {
+    return `
+      <div class="intruder-card intruder-alert">
+        <strong>Intruder Alert</strong>
+        <span>Points: ${compactNumber(Number(payload.points || 0))}</span>
+      </div>
+    `;
+  }
+  if (type === "shot") {
+    return `
+      <div class="intruder-card intruder-shot">
+        <strong>Intruder shot by ${html(payload.username || "someone")}</strong>
+        <span>Total points = ${compactNumber(Number(payload.total || 0))}</span>
+      </div>
+    `;
+  }
+  if (type === "survived") {
+    return `
+      <div class="intruder-card intruder-survived">
+        <strong>Intruder survived</strong>
+        <span>Better luck next time.</span>
+      </div>
+    `;
+  }
+  return "";
+}
+
+function renderMessageBody(body, user = {}) {
+  if (String(user.username || "").toLowerCase() === "intruder" && body.startsWith(intruderPrefix)) {
+    try {
+      return renderIntruderMessage(JSON.parse(body.slice(intruderPrefix.length))) || "";
+    } catch (_error) {
+      return "";
+    }
+  }
   if (/^@wb\s+/i.test(body)) {
     const username = body.replace(/^@wb\s+/i, "").trim();
     return `<div class="welcome-card"><span>Welcome back</span><strong>@${html(username)}</strong><small>The town saved your seat.</small></div>`;
@@ -482,6 +590,7 @@ function renderMessageBody(body) {
 
 function closeMessageMenus() {
   $$(".message-menu").forEach((menu) => menu.classList.add("hidden"));
+  $$(".message.menu-open").forEach((message) => message.classList.remove("menu-open"));
 }
 
 function renderSlashSuggestions() {
@@ -509,6 +618,7 @@ function bindMessageActions() {
     const wasHidden = menu.classList.contains("hidden");
     closeMessageMenus();
     menu.classList.toggle("hidden", !wasHidden);
+    button.closest(".message")?.classList.toggle("menu-open", wasHidden);
   }));
   $$(".message-menu").forEach((menu) => menu.addEventListener("click", () => closeMessageMenus()));
   $$(".message-card", $("#messages")).forEach((card) => {
@@ -689,6 +799,7 @@ function renderVip() {
 
 async function renderNews() {
   if ($("#newsView").classList.contains("active")) clearNewsUnread();
+  syncNewsComposerAccess();
   const posts = await api("/api/social/news");
   $("#newsList").innerHTML = posts.map((post) => `
     <article class="news-card">
@@ -725,9 +836,93 @@ async function renderNews() {
   }));
 }
 
+async function submitNewsForm(form) {
+  await api("/api/social/news", { method: "POST", body: new FormData(form) });
+  toast("News posted.");
+  form.reset();
+  const composer = $("#newsComposerArea");
+  if (composer) {
+    composer.classList.add("hidden");
+    composer.innerHTML = "";
+  }
+  if ($("#newsView").classList.contains("active")) await renderNews();
+}
+
+function openNewsComposer() {
+  if (!canPostNews()) {
+    toast("Your rank cannot post news.");
+    return;
+  }
+  const composer = $("#newsComposerArea");
+  if (!composer) return;
+  composer.innerHTML = `
+    <form id="quickNewsForm" class="news-compose-card">
+      <label>Topic<input name="title" maxlength="120" placeholder="Town update" required /></label>
+      <label>Description<textarea name="body" maxlength="2000" placeholder="Write the news..." required></textarea></label>
+      <label>Upload file<input name="image" type="file" accept="image/*" /></label>
+      <article id="newsComposerPreview" class="news-card news-compose-preview hidden">
+        <div class="news-art"><span>TCT</span></div>
+        <div><span class="eyebrow">Preview</span><h3></h3><p></p></div>
+      </article>
+      <div class="news-compose-actions">
+        <button class="primary" type="submit">Post news</button>
+        <button data-news-compose-close type="button">Cancel</button>
+      </div>
+    </form>
+  `;
+  composer.classList.remove("hidden");
+  composer.scrollIntoView({ block: "nearest", behavior: "smooth" });
+  const form = $("#quickNewsForm");
+  const preview = $("#newsComposerPreview");
+  const titleInput = form.elements.title;
+  const bodyInput = form.elements.body;
+  const imageInput = form.elements.image;
+  let previewUrl = "";
+  const updatePreview = () => {
+    const title = titleInput.value.trim();
+    const body = bodyInput.value.trim();
+    const file = imageInput.files?.[0];
+    if (previewUrl) URL.revokeObjectURL(previewUrl);
+    previewUrl = file ? URL.createObjectURL(file) : "";
+    preview.classList.toggle("hidden", !title && !body && !file);
+    $("h3", preview).textContent = title || "Town update";
+    $("p", preview).textContent = body || "Your announcement will appear here.";
+    const media = previewUrl
+      ? `<img src="${html(previewUrl)}" alt="" />`
+      : `<div class="news-art"><span>TCT</span></div>`;
+    preview.firstElementChild.outerHTML = media;
+  };
+  ["input", "change"].forEach((eventName) => form.addEventListener(eventName, updatePreview));
+  form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const submitButton = form.querySelector("button[type='submit']");
+    if (submitButton) {
+      submitButton.disabled = true;
+      submitButton.textContent = "Posting...";
+    }
+    try {
+      await submitNewsForm(event.currentTarget);
+      if (previewUrl) URL.revokeObjectURL(previewUrl);
+    } catch (error) {
+      toast(error.message);
+    } finally {
+      if (submitButton?.isConnected) {
+        submitButton.disabled = false;
+        submitButton.textContent = "Post news";
+      }
+    }
+  });
+  $("[data-news-compose-close]", form).addEventListener("click", () => {
+    if (previewUrl) URL.revokeObjectURL(previewUrl);
+    composer.classList.add("hidden");
+    composer.innerHTML = "";
+  });
+  titleInput.focus();
+}
+
 async function renderLeaderboard() {
   const data = await api("/api/social/leaderboards");
-  const labels = { xp: "Top XP", gold: "Top Gold", diamonds: "Top Diamonds" };
+  const labels = { xp: "Top XP", gold: "Top Gold", diamonds: "Top Diamonds", shooters: "Top Shooters" };
   const rows = data[state.leaderboardTab] || [];
   $("#leaderboard").innerHTML = `
     <div class="leaderboard-tabs">
@@ -735,12 +930,19 @@ async function renderLeaderboard() {
     </div>
     <div class="leaderboard-list">
       ${rows.map((user, index) => {
-        const value = state.leaderboardTab === "gold" ? user.gold : state.leaderboardTab === "diamonds" ? user.diamonds : user.xp;
+        const value = state.leaderboardTab === "gold"
+          ? user.gold
+          : state.leaderboardTab === "diamonds"
+            ? user.diamonds
+            : state.leaderboardTab === "shooters"
+              ? user.intruder_points
+              : user.xp;
+        const meta = state.leaderboardTab === "shooters" ? ` | ${compactNumber(user.intruder_shots || 0)} shots` : "";
         return `
           <article class="leaderboard-row">
             <span class="leaderboard-rank">#${index + 1}</span>
             <img class="avatar" src="${html(user.avatar_url || "/assets/avatar-other.svg")}" alt="" />
-            <div><strong>${html(user.display_name || user.username)}</strong><small>${rankBadge(user.rank_name, user.profile_title)}</small></div>
+            <div><strong>${html(user.display_name || user.username)}</strong><small>${rankBadge(user.rank_name, user.profile_title)}${meta}</small></div>
             <b>${compactNumber(value)}</b>
           </article>
         `;
@@ -767,6 +969,25 @@ async function refreshPmUnread() {
   state.unreadPm = Number(data.count || 0);
   setBadges();
   return state.unreadPm;
+}
+
+async function refreshUsersLight() {
+  const data = await api("/api/auth/users");
+  state.me = data.me || state.me;
+  if (state.me) state.me.chatBackground = normalizeRoomBackground(state.me.chatBackground);
+  state.users = data.users || state.users;
+  state.permissions = data.permissions || state.permissions || {};
+  syncNewsComposerAccess();
+  renderUsers();
+  renderProfiles();
+  applyRoomBackground();
+}
+
+function scheduleUsersRefresh() {
+  clearTimeout(state.usersRefreshTimer);
+  state.usersRefreshTimer = setTimeout(() => {
+    refreshUsersLight().catch(() => {});
+  }, 350);
 }
 
 function renderFriends() {
@@ -1285,27 +1506,40 @@ function openLevelPanel() {
 }
 
 function openChatOptionsPanel() {
-  const current = localStorage.getItem("tct_theme") || document.body.dataset.theme || "dark";
+  const currentBackground = normalizeRoomBackground(state.me?.chatBackground);
   setDrawerChrome({ title: "Chat options" });
   $("#drawerBody").innerHTML = `
     <div class="theme-panel">
-      <h3>Theme</h3>
-      <p class="muted">Choose how the chat feels on your screen.</p>
-      <div class="theme-choice-grid">
-        ${themeChoices.map(([id, label, color]) => `
-          <button class="${id === current ? "active" : ""}" data-theme-choice="${id}" type="button">
-            <span style="background:${html(color)}"></span>
-            <strong>${html(label)}</strong>
-          </button>
-        `).join("")}
+      <h3>Room background</h3>
+      <p class="muted">Choose the room image shown behind chat.</p>
+      <div class="background-choice-grid">
+        ${roomBackgroundChoices.map(([id, label, url]) => {
+          return `
+            <button class="${id === currentBackground ? "active" : ""}" data-room-background="${html(id)}" type="button">
+              <span style="background-image:url('${html(url)}')"></span>
+              <strong>${html(label)}</strong>
+            </button>
+          `;
+        }).join("")}
       </div>
     </div>
   `;
   showDrawer();
-  $$("[data-theme-choice]").forEach((button) => button.addEventListener("click", () => {
-    applyTheme(button.dataset.themeChoice);
-    $$("[data-theme-choice]").forEach((node) => node.classList.toggle("active", node === button));
-    toast(`${button.textContent.trim()} theme applied.`);
+  $$("[data-room-background]").forEach((button) => button.addEventListener("click", async () => {
+    const chatBackground = normalizeRoomBackground(button.dataset.roomBackground);
+    button.disabled = true;
+    try {
+      const data = await api("/api/auth/me", { method: "PATCH", body: JSON.stringify({ chatBackground }) });
+      state.me = { ...state.me, ...(data.me || {}), chatBackground };
+      state.me.chatBackground = normalizeRoomBackground(state.me.chatBackground);
+      applyRoomBackground(chatBackground);
+      $$("[data-room-background]").forEach((node) => node.classList.toggle("active", node === button));
+      toast(`${button.textContent.trim()} background applied.`);
+    } catch (error) {
+      toast(error.message);
+    } finally {
+      button.disabled = false;
+    }
   }));
 }
 
@@ -1642,27 +1876,50 @@ function openPm(userId, fallbackUser = null) {
     if (state.pmUploadFile) form.append("attachment", state.pmUploadFile);
     try {
       $("#pmInput").value = "";
-      await api("/api/chat/private-messages", { method: "POST", body: form });
+      const sent = await api("/api/chat/private-messages", { method: "POST", body: form });
       state.pmUploadFile = null;
       $("#pmAttachment").value = "";
       $("#pmUploadPreview").classList.add("hidden");
-      await loadPm(numericUserId);
+      appendPmMessage({
+        ...sent,
+        sender_id: sent.sender_id || sent.senderId || state.me.id,
+        sender_username: sent.sender_username || sent.senderUsername || state.me.username,
+        created_at: sent.created_at || sent.createdAt || new Date().toISOString(),
+      });
     } catch (error) {
       toast(error.message);
     }
   });
 }
 
-async function loadPm(userId) {
-  const rows = await api(`/api/chat/private-messages/${userId}`);
-  refreshPmUnread().catch(() => {});
-  $("#pmThread").innerHTML = rows.map((row) => `
-    <div class="pm-message ${Number(row.sender_id) === Number(state.me.id) ? "own" : ""}">
-      <span><strong>${html(row.sender_username)}</strong><small>${formatTime(row.created_at)}${row.read_at ? " | seen" : ""}</small></span>
+function pmMessageHtml(row) {
+  const own = Number(row.sender_id || row.senderId) === Number(state.me.id);
+  const createdAt = row.created_at || row.createdAt;
+  const sender = row.sender_username || row.senderUsername || (own ? state.me.username : "User");
+  const attachment = row.attachment_url || row.attachmentUrl;
+  return `
+    <div class="pm-message ${own ? "own" : ""}" data-pm-message-id="${html(row.id || "")}">
+      <span><strong>${html(sender)}</strong><small>${formatTime(createdAt)}${row.read_at ? " | seen" : ""}</small></span>
       ${row.body ? `<p>${html(row.body)}</p>` : ""}
-      ${row.attachment_url ? `<img class="pm-attachment" src="${html(row.attachment_url)}" alt="Private message attachment" />` : ""}
+      ${attachment ? `<img class="pm-attachment" src="${html(attachment)}" alt="Private message attachment" loading="lazy" decoding="async" />` : ""}
     </div>
-  `).join("") || '<p class="muted">No private messages yet.</p>';
+  `;
+}
+
+function appendPmMessage(row) {
+  const thread = $("#pmThread");
+  if (!thread) return;
+  if (row.id && $$(".pm-message", thread).some((node) => node.dataset.pmMessageId === String(row.id))) return;
+  if (thread.querySelector(".muted")) thread.innerHTML = "";
+  thread.insertAdjacentHTML("beforeend", pmMessageHtml(row));
+  while (thread.querySelectorAll(".pm-message").length > 60) thread.querySelector(".pm-message")?.remove();
+  thread.scrollTop = thread.scrollHeight;
+}
+
+async function loadPm(userId) {
+  const rows = await api(`/api/chat/private-messages/${userId}?limit=50`);
+  refreshPmUnread().catch(() => {});
+  $("#pmThread").innerHTML = rows.map(pmMessageHtml).join("") || '<p class="muted">No private messages yet.</p>';
   $("#pmThread").scrollTop = $("#pmThread").scrollHeight;
 }
 
@@ -1759,6 +2016,39 @@ async function openPmConversations() {
 
 async function renderAdmin() {
   const data = await api("/api/admin/dashboard");
+  const intruder = data.tools?.intruder;
+  const intruderNext = intruder?.nextSpawnAt ? `${formatDate(intruder.nextSpawnAt)} ${formatTime(intruder.nextSpawnAt)}` : "Stopped";
+  const intruderActive = intruder?.activeRound ? `Active now | ${compactNumber(intruder.activeRound.points)} pts` : "No active round";
+  const toolsSection = intruder ? `
+    <section class="panel admin-panel developer-tools-panel">
+      <div class="section-title-row"><h2>Tools</h2><span class="rank-pill rank-developer">DEV</span></div>
+      <article class="tool-card intruder-tool-card">
+        <div class="tool-card-head">
+          <img class="avatar avatar-lg" src="${html(intruder.botAvatarUrl || "/assets/intruder-bot.png")}" alt="" />
+          <span><strong>${html(intruder.botName || "Intruder")}</strong><small>${intruder.enabled ? "Running" : "Stopped"} | ${html(intruderActive)}</small></span>
+        </div>
+        <form id="intruderToolsForm" class="tool-form">
+          <label>Interval minutes<input id="intruderInterval" type="number" min="5" step="5" value="${html(intruder.intervalMinutes || 5)}" /></label>
+          <small>Next arrival: ${html(intruderNext)}</small>
+          <div class="tool-actions">
+            <button class="primary" type="submit">${intruder.enabled ? "Save" : "Start"}</button>
+            <button id="intruderStopButton" type="button" ${intruder.enabled ? "" : "disabled"}>Stop</button>
+            <button id="intruderResetButton" class="danger-action" type="button">Reset Top Shooters</button>
+          </div>
+        </form>
+        <div class="tool-score-list">
+          ${(intruder.scores || []).map((user, index) => `
+            <div class="tool-score-row">
+              <span>#${index + 1}</span>
+              <img class="avatar" src="${html(user.avatar_url || "/assets/avatar-other.svg")}" alt="" />
+              <strong>${html(user.display_name || user.username)}</strong>
+              <b>${compactNumber(user.intruder_points || 0)}</b>
+            </div>
+          `).join("") || '<p class="muted">No shots yet.</p>'}
+        </div>
+      </article>
+    </section>
+  ` : "";
   $("#adminDashboard").innerHTML = `
     <section class="admin-hero">
       <div>
@@ -1774,14 +2064,7 @@ async function renderAdmin() {
       <article class="stat-card"><strong>${data.stats.rooms}</strong><span>Rooms</span></article>
       <article class="stat-card"><strong>${data.stats.openReports}</strong><span>Open reports</span></article>
     </div>
-    <section class="panel admin-panel"><h2>Post news</h2>
-      <form id="adminNewsForm" class="news-form">
-        <input name="title" placeholder="News title" required />
-        <input name="imageUrl" placeholder="Optional image URL" />
-        <textarea name="body" placeholder="Write the announcement, event, or site update" required></textarea>
-        <button class="primary" type="submit">Publish news</button>
-      </form>
-    </section>
+    ${toolsSection}
     <section class="panel admin-panel"><h2>Create room</h2>
       <form id="adminCreateRoom" class="room-create-form">
         <input name="name" placeholder="Room name" required />
@@ -1831,19 +2114,31 @@ async function renderAdmin() {
   `;
   $("#adminRefresh").addEventListener("click", renderAdmin);
   $("#adminClose").addEventListener("click", () => setView("chat"));
-  $("#adminNewsForm").addEventListener("submit", async (event) => {
-    event.preventDefault();
-    await api("/api/admin/news", { method: "POST", body: JSON.stringify(Object.fromEntries(new FormData(event.currentTarget))) });
-    toast("News posted.");
-    event.currentTarget.reset();
-    if ($("#newsView").classList.contains("active")) await renderNews();
-  });
   $("#adminCreateRoom").addEventListener("submit", async (event) => {
     event.preventDefault();
     const form = new FormData(event.currentTarget);
     await api("/api/chat/rooms", { method: "POST", body: form });
     toast("Room created.");
     await bootstrap();
+    await renderAdmin();
+  });
+  $("#intruderToolsForm")?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const intervalMinutes = Number($("#intruderInterval")?.value || 5);
+    await api("/api/admin/tools/intruder", { method: "POST", body: JSON.stringify({ enabled: true, intervalMinutes }) });
+    toast("Intruder started.");
+    await renderAdmin();
+  });
+  $("#intruderStopButton")?.addEventListener("click", async () => {
+    const intervalMinutes = Number($("#intruderInterval")?.value || 5);
+    await api("/api/admin/tools/intruder", { method: "POST", body: JSON.stringify({ enabled: false, intervalMinutes }) });
+    toast("Intruder stopped.");
+    await renderAdmin();
+  });
+  $("#intruderResetButton")?.addEventListener("click", async () => {
+    if (!confirm("Reset Top Shooters to 0?")) return;
+    await api("/api/admin/tools/intruder/reset", { method: "POST" });
+    toast("Top Shooters reset.");
     await renderAdmin();
   });
   $$("[data-admin-user]").forEach((button) => button.addEventListener("click", () => openStaffActions(button.dataset.adminUser)));
@@ -1882,29 +2177,40 @@ async function renderAdmin() {
   }));
 }
 
-function connectEvents() {
-  if (state.eventSource) return;
-  state.eventSource = new EventSource(`/api/chat/events?token=${encodeURIComponent(state.token)}`);
-  state.eventSource.addEventListener("message", (event) => {
-    const message = JSON.parse(event.data);
-    if (Number(message.room_id) === Number(state.currentRoomId)) {
-      state.messages.push(message);
-      renderMessages();
-    }
-  });
-  state.eventSource.addEventListener("typing", (event) => {
-    const data = JSON.parse(event.data);
+const realtimeHandlers = {
+  message(message) {
+    if (Number(message.room_id) !== Number(state.currentRoomId)) return;
+    if (state.messages.some((item) => Number(item.id) === Number(message.id))) return;
+    state.messages.push(message);
+    if (state.messages.length > 60) state.messages = state.messages.slice(-60);
+    renderMessages();
+  },
+  typing(data) {
     if (Number(data.roomId) === Number(state.currentRoomId) && Number(data.userId) !== Number(state.me.id)) {
       $("#typingText").textContent = `${data.username} is typing...`;
       clearTimeout(state.typingTimeout);
       state.typingTimeout = setTimeout(setTypingIdle, 1800);
     }
-  });
-  state.eventSource.addEventListener("notification", async () => { state.notifications = await api("/api/social/notifications"); setBadges(); refreshReportBadge().catch(() => {}); });
-  state.eventSource.addEventListener("private-message", (event) => {
-    const data = JSON.parse(event.data || "{}");
+  },
+  notification(data = {}) {
+    state.notifications.unshift({ ...data, is_read: 0, created_at: new Date().toISOString() });
+    state.notifications = state.notifications.slice(0, 12);
+    if (["friend-request", "friend-accepted"].includes(data.type)) loadFriends().catch(() => {});
+    setBadges();
+    refreshReportBadge().catch(() => {});
+  },
+  "friend-request-updated"() {
+    loadFriends().catch(() => {});
+  },
+  "private-message"(data = {}) {
     if (state.activePmUserId && Number(data.senderId) === Number(state.activePmUserId) && !$("#drawer").classList.contains("hidden")) {
-      loadPm(state.activePmUserId).catch(() => {});
+      appendPmMessage({
+        ...data,
+        sender_id: data.sender_id || data.senderId,
+        sender_username: data.sender_username || data.senderUsername,
+        created_at: data.created_at || data.createdAt || new Date().toISOString(),
+      });
+      refreshPmUnread().catch(() => {});
       return;
     }
     refreshPmUnread().catch(() => {
@@ -1914,9 +2220,8 @@ function connectEvents() {
     if (!state.activePmUserId && !$("#drawer").classList.contains("hidden") && $("#drawerTitle").textContent === "Private messages") {
       openPmConversations().catch(() => {});
     }
-  });
-  state.eventSource.addEventListener("private-chat-deleted", (event) => {
-    const data = JSON.parse(event.data || "{}");
+  },
+  "private-chat-deleted"(data = {}) {
     const affectedIds = [data.otherUserId, data.userOneId, data.userTwoId].map(Number).filter(Boolean);
     if (state.activePmUserId && affectedIds.includes(Number(state.activePmUserId)) && !$("#drawer").classList.contains("hidden")) {
       loadPm(state.activePmUserId).catch(() => {});
@@ -1927,58 +2232,99 @@ function connectEvents() {
       openPmConversations().catch(() => {});
     }
     refreshPmUnread().catch(() => {});
-  });
-  state.eventSource.addEventListener("moderation", (event) => {
-    const data = JSON.parse(event.data);
+  },
+  moderation(data = {}) {
     toast(data.body || data.title || "Staff action applied.");
     if (["kick", "ban"].includes(data.action)) {
       localStorage.removeItem("tct_token");
       setTimeout(() => location.reload(), 900);
     }
-  });
-  state.eventSource.addEventListener("users-changed", async () => {
-    const data = await api("/api/auth/me");
-    state.me = data.me;
-    state.users = data.users;
-    state.notifications = data.notifications || state.notifications;
-    state.unreadPm = Number(data.unreadPm || state.unreadPm || 0);
-    renderUsers();
-    renderProfiles();
+  },
+  "users-changed"() {
+    scheduleUsersRefresh();
     if ($("#leaderboardView").classList.contains("active")) renderLeaderboard().catch((error) => toast(error.message));
     setBadges();
-  });
-  state.eventSource.addEventListener("message-updated", (event) => {
-    const data = JSON.parse(event.data);
+  },
+  "intruder-score-updated"() {
+    if ($("#leaderboardView").classList.contains("active")) renderLeaderboard().catch((error) => toast(error.message));
+    if ($("#adminView").classList.contains("active")) renderAdmin().catch((error) => toast(error.message));
+  },
+  "intruder-settings-updated"() {
+    if ($("#adminView").classList.contains("active")) renderAdmin().catch((error) => toast(error.message));
+  },
+  "message-updated"(data = {}) {
     const message = state.messages.find((item) => Number(item.id) === Number(data.id));
     if (message) message.body = data.body;
     renderMessages();
-  });
-  state.eventSource.addEventListener("message-deleted", (event) => {
-    const data = JSON.parse(event.data);
+  },
+  "message-deleted"(data = {}) {
     state.messages = state.messages.filter((item) => Number(item.id) !== Number(data.id));
     renderMessages();
-  });
-  state.eventSource.addEventListener("room-cleared", (event) => {
-    const data = JSON.parse(event.data);
+  },
+  "room-cleared"(data = {}) {
     if (Number(data.roomId) === Number(state.currentRoomId)) {
       state.messages = [];
       renderMessages();
       toast(`${data.by || "Staff"} cleared this room.`);
     }
-  });
-  state.eventSource.addEventListener("reaction", loadMessages);
-  state.eventSource.addEventListener("message-pinned", loadMessages);
-  state.eventSource.addEventListener("rooms-changed", bootstrap);
-  state.eventSource.addEventListener("news-posted", (event) => {
-    const data = JSON.parse(event.data || "{}");
+  },
+  reaction() {
+    loadMessages().catch(() => {});
+  },
+  "message-pinned"() {
+    loadMessages().catch(() => {});
+  },
+  "rooms-changed"() {
+    bootstrap().catch((error) => toast(error.message));
+  },
+  "news-posted"(data = {}) {
     const newsIsOpen = $("#newsView").classList.contains("active");
     if (!data.comment && !newsIsOpen) markNewsUnread();
     if (newsIsOpen) {
       clearNewsUnread();
       renderNews().catch((error) => toast(error.message));
     }
+  },
+  "report-created"() {
+    refreshReportBadge().catch(() => {});
+  },
+};
+
+function connectEventSourceFallback() {
+  if (state.eventSource) return;
+  state.eventSource = new EventSource(`/api/chat/events?token=${encodeURIComponent(state.token)}`);
+  Object.entries(realtimeHandlers).forEach(([eventName, handler]) => {
+    state.eventSource.addEventListener(eventName, (event) => {
+      const data = event.data ? JSON.parse(event.data) : {};
+      handler(data);
+    });
   });
-  state.eventSource.addEventListener("report-created", () => refreshReportBadge().catch(() => {}));
+}
+
+function connectEvents() {
+  if (state.socket || state.eventSource) return;
+  if (window.io) {
+    state.socket = window.io({
+      auth: { token: state.token },
+      transports: ["websocket"],
+      upgrade: false,
+      reconnection: true,
+      reconnectionAttempts: Infinity,
+      reconnectionDelay: 700,
+      reconnectionDelayMax: 5000,
+    });
+    Object.entries(realtimeHandlers).forEach(([eventName, handler]) => {
+      state.socket.on(eventName, handler);
+    });
+    state.socket.on("connect_error", (error) => {
+      console.warn("Socket connection failed; using fallback event stream.", error.message);
+      state.socket?.disconnect();
+      state.socket = null;
+      connectEventSourceFallback();
+    });
+    return;
+  }
+  connectEventSourceFallback();
 }
 
 async function logout() {
@@ -2091,6 +2437,7 @@ function bindEvents() {
     event.stopPropagation();
     openReportQueueDrawer().catch((error) => toast(error.message));
   });
+  $("#newsComposeButton")?.addEventListener("click", openNewsComposer);
   $("#menuButton").addEventListener("click", () => $("#app").classList.toggle("nav-open"));
   $("#roomSwitchButton")?.addEventListener("click", openRoomSwitcher);
   $("#rightToggleButton").addEventListener("click", () => $("#app").classList.toggle("right-closed"));
@@ -2102,7 +2449,15 @@ function bindEvents() {
   $("#notificationIcon").addEventListener("click", async () => {
     setDrawerChrome({ title: "Notifications" });
     const rows = await api("/api/social/notifications");
-    $("#drawerBody").innerHTML = rows.map((n) => `<div class="request-row"><span><strong>${html(n.title)}</strong><small>${html(n.body)}</small></span></div>`).join("") || '<p class="muted">No notifications.</p>';
+    $("#drawerBody").innerHTML = `
+      <div class="notification-list">
+        ${rows.map((n) => `
+          <div class="request-row notification-row">
+            <span><strong>${html(String(n.title || "Notification").slice(0, 80))}</strong><small>${html(String(n.body || "").slice(0, 140))}</small></span>
+          </div>
+        `).join("") || '<p class="muted">No notifications.</p>'}
+      </div>
+    `;
     showDrawer();
     await api("/api/social/notifications/read", { method: "POST" });
     state.notifications = rows.map((row) => ({ ...row, is_read: 1 }));
