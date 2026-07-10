@@ -4,6 +4,7 @@ const pool = require("../database");
 const { requireAuth, isStaff, rankPower } = require("../middleware/auth");
 const { imageUpload, fileToDataUrl } = require("../services/upload");
 const { addClient, removeClient, broadcast, notifyUser } = require("../services/events");
+const { handlePossibleShot } = require("../services/intruderService");
 const { publicUser } = require("../services/userService");
 
 const router = express.Router();
@@ -54,7 +55,9 @@ router.get("/events", requireAuth, async (req, res) => {
     "Cache-Control": "no-cache",
     Connection: "keep-alive",
   });
-  await pool.query("UPDATE users SET last_seen = NOW() WHERE id = ?", [req.user.id]);
+  await pool.query("UPDATE users SET last_seen = NOW() WHERE id = ?", [req.user.id]).catch((error) => {
+    console.error("Could not update last_seen for SSE connect:", error.message);
+  });
   addClient(req.user.id, res);
   broadcast("users-changed", { userId: req.user.id });
   req.on("close", async () => {
@@ -65,6 +68,7 @@ router.get("/events", requireAuth, async (req, res) => {
 });
 
 router.get("/rooms/:roomId/messages", requireAuth, requireRoomAccess, async (req, res) => {
+  const limit = Math.min(Math.max(Number(req.query.limit) || 50, 20), 80);
   const [rows] = await pool.query(
     `SELECT recent.* FROM (
        SELECT m.*, u.username, u.rank_name, u.profile_title, u.avatar_url, u.username_color, u.text_color, u.bubble_style,
@@ -75,10 +79,10 @@ router.get("/rooms/:roomId/messages", requireAuth, requireRoomAccess, async (req
        JOIN users u ON u.id = m.user_id
        WHERE m.room_id = ? AND m.deleted_at IS NULL
        ORDER BY m.created_at DESC
-       LIMIT 150
+       LIMIT ?
      ) recent
      ORDER BY recent.is_pinned DESC, recent.created_at ASC`,
-    [req.params.roomId]
+    [req.params.roomId, limit]
   );
   res.json(rows);
 });
@@ -109,6 +113,9 @@ router.post("/rooms/:roomId/messages", requireAuth, requireRoomAccess, upload.si
     [result.insertId]
   );
   broadcast("message", rows[0]);
+  handlePossibleShot(rows[0], req.user).catch((error) => {
+    console.error("[intruder] shot handling failed:", error.message);
+  });
   broadcast("users-changed", { userId: req.user.id });
   res.status(201).json(rows[0]);
 });
@@ -241,11 +248,16 @@ router.post("/private-messages", requireAuth, upload.single("attachment"), async
   );
   const payload = {
     id: result.insertId,
+    sender_id: req.user.id,
     senderId: req.user.id,
+    sender_username: req.user.username,
     senderUsername: req.user.username,
+    receiver_id: receiverId,
     receiverId,
     body,
+    attachment_url: attachmentUrl,
     attachmentUrl,
+    created_at: new Date(),
     createdAt: new Date()
   };
   notifyUser(receiverId, "private-message", payload);
@@ -253,14 +265,19 @@ router.post("/private-messages", requireAuth, upload.single("attachment"), async
 });
 
 router.get("/private-messages/:userId", requireAuth, async (req, res) => {
+  const limit = Math.min(Math.max(Number(req.query.limit) || 50, 20), 80);
   const [rows] = await pool.query(
-    `SELECT pm.*, su.username AS sender_username, ru.username AS receiver_username
-     FROM private_messages pm
-     JOIN users su ON su.id = pm.sender_id
-     JOIN users ru ON ru.id = pm.receiver_id
-     WHERE ((sender_id = ? AND receiver_id = ?) OR (sender_id = ? AND receiver_id = ?)) AND deleted_at IS NULL
-     ORDER BY created_at ASC LIMIT 100`,
-    [req.user.id, req.params.userId, req.params.userId, req.user.id]
+    `SELECT recent.* FROM (
+       SELECT pm.*, su.username AS sender_username, ru.username AS receiver_username
+       FROM private_messages pm
+       JOIN users su ON su.id = pm.sender_id
+       JOIN users ru ON ru.id = pm.receiver_id
+       WHERE ((sender_id = ? AND receiver_id = ?) OR (sender_id = ? AND receiver_id = ?)) AND deleted_at IS NULL
+       ORDER BY pm.created_at DESC
+       LIMIT ?
+     ) recent
+     ORDER BY recent.created_at ASC`,
+    [req.user.id, req.params.userId, req.params.userId, req.user.id, limit]
   );
   await pool.query("UPDATE private_messages SET read_at = NOW() WHERE receiver_id = ? AND sender_id = ? AND read_at IS NULL", [req.user.id, req.params.userId]);
   res.json(rows);
