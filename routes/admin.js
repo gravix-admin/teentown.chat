@@ -5,6 +5,8 @@ const { requireAuth, canControl, isStaff, rankPower } = require("../middleware/a
 const { adminStats } = require("../services/userService");
 const { ranks, staffTools } = require("../services/schema");
 const { broadcast, notifyUser } = require("../services/events");
+const { imageUpload, fileToDataUrl } = require("../services/upload");
+const { getIntruderState, resetIntruderScores, updateIntruderSettings } = require("../services/intruderService");
 const {
   normalizeUsername,
   normalizeEmail,
@@ -16,9 +18,15 @@ const {
 } = require("../services/identity");
 
 const router = express.Router();
+const newsUpload = imageUpload("news");
 
 function hasPanel(user) {
   return ["admin", "chief", "developer"].includes(user.rank_name);
+}
+
+function developerOnly(req, res, next) {
+  if (req.user.rank_name !== "developer") return res.status(403).json({ error: "Developer access required." });
+  next();
 }
 
 async function permission(user, tool) {
@@ -80,6 +88,7 @@ router.get("/dashboard", async (req, res) => {
     privateConversations,
     ranks,
     staffTools,
+    tools: req.user.rank_name === "developer" ? await getIntruderState() : null,
   });
 });
 
@@ -250,15 +259,15 @@ router.post("/permissions", async (req, res) => {
   if (rankPower(rank) >= rankPower(req.user.rank_name)) return res.status(403).json({ error: "You cannot edit that rank." });
   await pool.query("REPLACE INTO role_permissions (rank_name, tool, allowed) VALUES (?, ?, ?)", [rank, tool, allowed ? 1 : 0]);
   await log(req.user.id, "permission", "rank", null, `${rank}:${tool}:${allowed}`);
+  broadcast("users-changed", { rank, tool });
   res.json({ ok: true });
 });
 
-router.post("/news", async (req, res) => {
-  if (!hasPanel(req.user)) return res.status(403).json({ error: "Admin panel access required." });
+router.post("/news", newsUpload.single("image"), async (req, res) => {
   if (!(await permission(req.user, "postNews"))) return res.status(403).json({ error: "Your rank cannot post news." });
   const title = String(req.body.title || "").trim().slice(0, 120);
   const body = String(req.body.body || "").trim().slice(0, 2000);
-  const imageUrl = String(req.body.imageUrl || "").trim().slice(0, 500) || null;
+  const imageUrl = req.file ? fileToDataUrl(req.file) : null;
   if (!title || !body) return res.status(400).json({ error: "News title and body are required." });
   const [result] = await pool.query(
     "INSERT INTO news_posts (author_id, title, body, image_url) VALUES (?, ?, ?, ?)",
@@ -276,6 +285,23 @@ router.post("/rank-badges", async (req, res) => {
   await pool.query("REPLACE INTO rank_badges (rank_name, label, color, image_url) VALUES (?, ?, ?, ?)", [rank, String(label || rank).slice(0, 16), String(color || "#8b5cf6").slice(0, 24), imageUrl || null]);
   await log(req.user.id, "rank_badge", "rank", null, rank);
   res.json({ ok: true });
+});
+
+router.get("/tools", developerOnly, async (_req, res) => {
+  res.json(await getIntruderState());
+});
+
+router.post("/tools/intruder", developerOnly, async (req, res) => {
+  const enabled = Boolean(req.body.enabled);
+  const state = await updateIntruderSettings({ enabled, intervalMinutes: req.body.intervalMinutes });
+  await log(req.user.id, enabled ? "intruder_start" : "intruder_stop", "tool", null, JSON.stringify(state.intruder));
+  res.json(state);
+});
+
+router.post("/tools/intruder/reset", developerOnly, async (req, res) => {
+  const state = await resetIntruderScores();
+  await log(req.user.id, "intruder_reset", "tool", null, "top shooters reset");
+  res.json(state);
 });
 
 module.exports = router;
